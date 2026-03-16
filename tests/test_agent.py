@@ -9,6 +9,7 @@ Tests verify that the agent:
 3. Tool security prevents path traversal
 4. Agentic loop executes correctly
 5. Exits with code 0 on success
+6. Uses correct tools for different question types (Task 3)
 """
 
 import json
@@ -273,6 +274,102 @@ def test_agent_has_source_field():
     assert isinstance(output["source"], str), "'source' must be a string"
 
 
+def test_agent_uses_read_file_for_framework_question():
+    """
+    Test that agent uses read_file tool when asked about the backend framework.
+    Task 3 Requirement: Source code questions should use read_file, not query_api.
+    """
+    
+    agent_path = Path(__file__).parent.parent / "agent.py"
+    test_question = "What framework does the backend use?"
+    
+    result = subprocess.run(
+        [sys.executable, "-m", "uv", "run", str(agent_path), test_question],
+        capture_output=True,
+        text=True,
+        timeout=60
+    )
+    
+    assert result.returncode == 0, f"Agent exited with code {result.returncode}: {result.stderr}"
+    
+    try:
+        output = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"Invalid JSON output: {e}\nStdout: {result.stdout}")
+    
+    # Verify tool_calls field exists
+    assert "tool_calls" in output, "Missing 'tool_calls' field in output"
+    
+    # Extract tool names from tool_calls
+    tool_names = [tc.get("tool") for tc in output.get("tool_calls", [])]
+    
+    # Task 3 Requirement: read_file should be used for source code questions
+    assert "read_file" in tool_names, (
+        f"Expected 'read_file' in tool_calls for framework question. "
+        f"Got tools: {tool_names}. "
+        f"The agent should read source code to find the framework, not query the API."
+    )
+    
+    # Verify answer mentions FastAPI (the expected framework)
+    answer = output.get("answer", "").lower()
+    assert "fastapi" in answer, (
+        f"Answer should mention 'FastAPI'. Got: {output.get('answer', '')}"
+    )
+    
+    print(f"✓ Test passed! Used tools: {tool_names}, Answer: {output['answer'][:100]}...")
+
+
+def test_agent_uses_query_api_for_database_count():
+    """
+    Test that agent uses query_api tool when asked about database item count.
+    Task 3 Requirement: Live data questions should use query_api, not read_file.
+    """
+    
+    agent_path = Path(__file__).parent.parent / "agent.py"
+    test_question = "How many items are in the database?"
+    
+    result = subprocess.run(
+        [sys.executable, "-m", "uv", "run", str(agent_path), test_question],
+        capture_output=True,
+        text=True,
+        timeout=60
+    )
+    
+    assert result.returncode == 0, f"Agent exited with code {result.returncode}: {result.stderr}"
+    
+    try:
+        output = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"Invalid JSON output: {e}\nStdout: {result.stdout}")
+    
+    # Verify tool_calls field exists
+    assert "tool_calls" in output, "Missing 'tool_calls' field in output"
+    
+    # Extract tool names from tool_calls
+    tool_names = [tc.get("tool") for tc in output.get("tool_calls", [])]
+    
+    # Task 3 Requirement: query_api should be used for live data questions
+    assert "query_api" in tool_names, (
+        f"Expected 'query_api' in tool_calls for database count question. "
+        f"Got tools: {tool_names}. "
+        f"The agent should query the live API for data, not read static files."
+    )
+    
+    # Verify answer contains a number (item count)
+    answer = output.get("answer", "")
+    import re
+    numbers = re.findall(r'\d+', answer)
+    assert len(numbers) > 0, (
+        f"Answer should contain a number (item count). Got: {answer}"
+    )
+    
+    # Verify the number is positive (there should be items in the database)
+    count = int(numbers[0])
+    assert count > 0, f"Item count should be greater than 0. Got: {count}"
+    
+    print(f"✓ Test passed! Used tools: {tool_names}, Answer: {output['answer'][:100]}...")
+
+
 def test_agent_error_handling():
     """Test that agent handles errors gracefully and outputs valid JSON."""
     
@@ -352,6 +449,8 @@ if __name__ == "__main__":
     print("\nRunning subprocess regression tests...")
     test_agent_outputs_valid_json()
     test_agent_has_source_field()
+    test_agent_uses_read_file_for_framework_question()  # NEW Task 3 test
+    test_agent_uses_query_api_for_database_count()  # NEW Task 3 test
     print("✓ Regression tests passed!")
     
     print("\nAll tests passed!")
