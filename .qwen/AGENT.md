@@ -50,3 +50,50 @@ Create `.env.agent.secret` in the project root:
 
 ```bash
 cp .env.agent.example .env.agent.secret
+
+
+# Documentation Agent
+
+This agent answers questions about the project by navigating the local wiki using tools.
+
+## Agentic Loop
+The agent operates in a loop:
+1. **Receive Query**: User asks a question via CLI.
+2. **LLM Decision**: The LLM decides whether to call a tool or answer.
+3. **Tool Execution**: If tools are requested (`list_files`, `read_file`), Python executes them securely.
+4. **Observation**: Tool results are fed back to the LLM.
+5. **Termination**: When the LLM has enough info, it returns a JSON answer.
+
+## Tools
+
+### `list_files`
+- **Purpose**: Discover available documentation files.
+- **Input**: `path` (string) - Relative directory path.
+- **Output**: Newline-separated list of files/folders.
+
+### `read_file`
+- **Purpose**: Read content of a specific documentation file.
+- **Input**: `path` (string) - Relative file path.
+- **Output**: File content string.
+
+## Security
+- **Path Traversal**: All paths are resolved using `pathlib`.
+- **Root Check**: Tools verify that the resolved absolute path starts with the project root directory.
+- **Restriction**: Paths containing `..` are rejected immediately.
+
+## System Prompt Strategy
+The system prompt instructs the LLM to:
+1. Act as a documentation assistant.
+2. Use tools to verify facts (no hallucination).
+3. Return the final answer in a specific JSON schema (`answer`, `source`).
+4. Include section anchors in the source field (e.g., `#setup`).
+
+## Output Format
+```json
+{
+  "answer": "String",
+  "source": "wiki/file.md#anchor",
+  "tool_calls": [
+    {"tool": "name", "args": {}, "result": "..."}
+  ]
+}
