@@ -1,16 +1,13 @@
-
-## 2. Agent Code (`agent.py`)
-
-
 #!/usr/bin/env python3
+
 """
-Agent CLI - Connects to an LLM and answers questions.
+Agent CLI - Connects to an LLM with tool support for documentation queries.
 
 Usage:
     uv run agent.py "Your question here"
 
 Output:
-    JSON line to stdout: {"answer": "...", "tool_calls": []}
+    JSON line to stdout: {"answer": "...", "source": "...", "tool_calls": []}
 """
 
 import argparse
@@ -18,6 +15,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables from .env.agent.secret
@@ -30,6 +28,8 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen3-coder-plus")
 
 # Timeout in seconds
 TIMEOUT = 60
+MAX_ITERATIONS = 10
+PROJECT_ROOT = Path.cwd().resolve()
 
 
 def log_debug(message: str) -> None:
@@ -37,15 +37,124 @@ def log_debug(message: str) -> None:
     print(f"[DEBUG] {message}", file=sys.stderr, flush=True)
 
 
-def call_llm(question: str) -> dict:
+# --- Tools ---
+
+def safe_path(path_str: str) -> Path:
+    """Resolve and validate a path to ensure it stays within the project root."""
+    if ".." in path_str:
+        raise ValueError("Path traversal not allowed")
+    
+    target = (PROJECT_ROOT / path_str).resolve()
+    
+    try:
+        # Check if target is within project root
+        target.relative_to(PROJECT_ROOT)
+    except ValueError:
+        raise ValueError(f"Access denied: {path_str} is outside project directory")
+    
+    return target
+
+
+def list_files(path: str) -> str:
+    """List files and directories at a given path."""
+    try:
+        safe = safe_path(path)
+        if not safe.exists():
+            return f"Error: {path} does not exist"
+        if not safe.is_dir():
+            return f"Error: {path} is not a directory"
+        
+        entries = [str(p.name) for p in safe.iterdir()]
+        return "\n".join(entries)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+def read_file(path: str) -> str:
+    """Read a file from the project repository."""
+    try:
+        safe = safe_path(path)
+        if not safe.exists():
+            return f"Error: {path} does not exist"
+        if not safe.is_file():
+            return f"Error: {path} is not a file"
+        
+        return safe.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# --- Tool Definitions for LLM ---
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files and directories in a specific path. Use this to discover wiki files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from project root (e.g., 'wiki')"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a specific file. Use this to find answers in documentation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    }
+]
+
+TOOL_MAP = {
+    "list_files": list_files,
+    "read_file": read_file
+}
+
+# --- System Prompt ---
+
+SYSTEM_PROMPT = """
+You are a Documentation Agent. Your goal is to answer user questions using the project wiki.
+You have access to tools: `list_files` and `read_file`.
+
+Instructions:
+1. Use `list_files` to discover wiki files (look in 'wiki/' directory first).
+2. Use `read_file` to read specific content from files you find.
+3. Find the exact answer and the source section.
+4. When you have the answer, respond with a JSON object ONLY. Do not add markdown formatting.
+   Format: {"answer": "your answer", "source": "path/to/file.md#section-anchor"}
+5. The source must include the file path and a section anchor (e.g., wiki/git-workflow.md#resolving-merge-conflicts).
+6. If you cannot find the answer after searching, state that in the JSON answer.
+"""
+
+
+def call_llm(messages: list, tool_calls_response: bool = False) -> dict:
     """
     Call the LLM API and get a response.
     
     Args:
-        question: The user's question
+        messages: List of message dicts for the conversation
+        tool_calls_response: Whether to expect tool calls in response
         
     Returns:
-        dict with 'answer' and 'tool_calls' keys
+        dict with 'content' and 'tool_calls' keys
         
     Raises:
         Exception: If API call fails
@@ -63,22 +172,18 @@ def call_llm(question: str) -> dict:
     log_debug(f"Calling LLM at {api_url}")
     log_debug(f"Model: {LLM_MODEL}")
     
-    # System prompt - minimal for now, will expand in later tasks
-    system_prompt = (
-        "You are a helpful AI assistant. Answer questions directly and concisely. "
-        "Do not use any tools yet - just provide the answer based on your knowledge."
-    )
-    
     # Build the request payload (OpenAI-compatible format)
     payload = {
         "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question}
-        ],
+        "messages": messages,
         "temperature": 0.7,
         "max_tokens": 1024,
     }
+    
+    # Add tools if we want tool calls
+    if tool_calls_response:
+        payload["tools"] = TOOLS
+        payload["tool_choice"] = "auto"
     
     # Headers for API authentication
     headers = {
@@ -102,26 +207,122 @@ def call_llm(question: str) -> dict:
     response_data = response.json()
     log_debug(f"Response: {json.dumps(response_data, indent=2)[:500]}...")
     
-    # Extract the answer from the response
+    # Extract the response from the API
     try:
-        answer = response_data["choices"][0]["message"]["content"]
+        choice = response_data["choices"][0]
+        message = choice["message"]
+        content = message.get("content", "")
+        tool_calls = message.get("tool_calls", [])
     except (KeyError, IndexError) as e:
         raise ValueError(f"Unexpected API response format: {e}")
     
-    # For Task 1, tool_calls is always empty
-    # Will be populated in Task 2 when we add tool support
-    tool_calls = []
-    
     return {
-        "answer": answer.strip(),
+        "content": content,
         "tool_calls": tool_calls
+    }
+
+
+def run_agentic_loop(question: str) -> dict:
+    """
+    Run the agentic loop for a given question.
+    
+    Args:
+        question: The user's question
+        
+    Returns:
+        dict with 'answer', 'source', and 'tool_calls' keys
+    """
+    # Initialize message history
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question}
+    ]
+    
+    tool_calls_log = []
+    iterations = 0
+    
+    while iterations < MAX_ITERATIONS:
+        iterations += 1
+        log_debug(f"Iteration {iterations}/{MAX_ITERATIONS}")
+        
+        # Call LLM with tool support
+        response = call_llm(messages, tool_calls_response=True)
+        
+        # Check for tool calls
+        if response["tool_calls"]:
+            log_debug(f"LLM requested {len(response['tool_calls'])} tool call(s)")
+            
+            for tool_call in response["tool_calls"]:
+                func_name = tool_call["function"]["name"]
+                func_args = json.loads(tool_call["function"]["arguments"])
+                tool_call_id = tool_call.get("id", f"call_{len(tool_calls_log)}")
+                
+                log_debug(f"Executing tool: {func_name} with args: {func_args}")
+                
+                # Execute tool
+                try:
+                    if func_name in TOOL_MAP:
+                        result = TOOL_MAP[func_name](**func_args)
+                    else:
+                        result = f"Error: Unknown tool {func_name}"
+                except Exception as e:
+                    result = f"Error: {str(e)}"
+                
+                # Log tool call
+                tool_calls_log.append({
+                    "tool": func_name,
+                    "args": func_args,
+                    "result": result
+                })
+                
+                # Append tool response to message history
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": func_name,
+                    "content": result
+                })
+            
+            # Continue loop to get LLM reaction to tool output
+            continue
+        
+        else:
+            # No tool calls, assume final answer
+            log_debug("LLM returned final answer")
+            content = response["content"]
+            
+            # Attempt to parse JSON from content
+            try:
+                # Clean up markdown if present
+                clean_content = content.replace("```json", "").replace("```", "").strip()
+                final_data = json.loads(clean_content)
+                return {
+                    "answer": final_data.get("answer", content),
+                    "source": final_data.get("source", "unknown"),
+                    "tool_calls": tool_calls_log
+                }
+            except json.JSONDecodeError:
+                # Fallback if LLM didn't return strict JSON
+                log_debug("LLM did not return valid JSON, using content as answer")
+                return {
+                    "answer": content,
+                    "source": "unknown",
+                    "tool_calls": tool_calls_log
+                }
+    
+    # Max iterations reached
+    log_debug("Maximum iterations reached")
+    return {
+        "answer": "Stopped due to maximum tool call limit.",
+        "source": "unknown",
+        "tool_calls": tool_calls_log
     }
 
 
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Agent CLI - Ask questions to an LLM"
+        description="Agent CLI - Ask questions to an LLM with tool support"
     )
     parser.add_argument(
         "question",
@@ -134,7 +335,7 @@ def main() -> int:
     log_debug(f"Received question: {args.question}")
     
     try:
-        result = call_llm(args.question)
+        result = run_agentic_loop(args.question)
         
         # Output valid JSON to stdout (single line)
         print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -146,6 +347,7 @@ def main() -> int:
         # Output error as JSON to maintain format consistency
         error_result = {
             "answer": f"Error: {str(e)}",
+            "source": "unknown",
             "tool_calls": []
         }
         print(json.dumps(error_result, ensure_ascii=False), file=sys.stdout, flush=True)
