@@ -17,14 +17,19 @@ import sys
 import time
 from pathlib import Path
 from dotenv import load_dotenv
+from typing import Optional
 
 # Load environment variables from .env.agent.secret
 load_dotenv(".env.agent.secret")
 
-# Configuration from environment
+# Configuration from environment - LLM
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_BASE = os.getenv("LLM_API_BASE")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3-coder-plus")
+
+# Configuration from environment - Backend API
+LMS_API_KEY = os.getenv("LMS_API_KEY")
+AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
 
 # Timeout in seconds
 TIMEOUT = 60
@@ -84,6 +89,55 @@ def read_file(path: str) -> str:
         return f"Error: {str(e)}"
 
 
+def query_api(method: str, path: str, body: Optional[str] = None) -> str:
+    """
+    Query the deployed backend API.
+    
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE)
+        path: API endpoint path (e.g., '/items/', '/analytics/completion-rate')
+        body: Optional JSON request body as a string
+        
+    Returns:
+        JSON string with 'status_code' and 'body' keys
+    """
+    import httpx
+    
+    if not LMS_API_KEY:
+        return json.dumps({"status_code": 500, "body": "Error: LMS_API_KEY not configured"})
+    
+    headers = {
+        "Authorization": f"Bearer {LMS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    
+    url = f"{AGENT_API_BASE_URL.rstrip('/')}{path}"
+    
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                response = client.post(url, headers=headers, content=body or "{}")
+            elif method.upper() == "PUT":
+                response = client.put(url, headers=headers, content=body or "{}")
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            else:
+                return json.dumps({"status_code": 400, "body": f"Error: Unsupported method {method}"})
+        
+        # Return structured response
+        return json.dumps({
+            "status_code": response.status_code,
+            "body": response.text
+        })
+        
+    except httpx.RequestError as e:
+        return json.dumps({"status_code": 0, "body": f"Connection error: {str(e)}"})
+    except Exception as e:
+        return json.dumps({"status_code": 500, "body": f"Error: {str(e)}"})
+
+
 # --- Tool Definitions for LLM ---
 
 TOOLS = [
@@ -91,13 +145,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories in a specific path. Use this to discover wiki files.",
+            "description": "List files and directories in a specific path. Use this to discover wiki files or source code structure.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root (e.g., 'wiki')"
+                        "description": "Relative path from project root (e.g., 'wiki' or 'backend/app')"
                     }
                 },
                 "required": ["path"]
@@ -108,16 +162,42 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a specific file. Use this to find answers in documentation.",
+            "description": "Read the contents of a specific file. Use this to find answers in documentation, wiki, or source code.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')"
+                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md' or 'backend/app/main.py')"
                     }
                 },
                 "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Query the deployed backend API. Use for data-dependent questions (item counts, scores, analytics) or to check system behavior (status codes, error responses). Do NOT use for wiki/documentation questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "DELETE"],
+                        "description": "HTTP method to use"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path, e.g., '/items/', '/analytics/completion-rate?lab=lab-99'"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body as a string (for POST/PUT)"
+                    }
+                },
+                "required": ["method", "path"]
             }
         }
     }
@@ -125,23 +205,36 @@ TOOLS = [
 
 TOOL_MAP = {
     "list_files": list_files,
-    "read_file": read_file
+    "read_file": read_file,
+    "query_api": query_api
 }
 
 # --- System Prompt ---
 
 SYSTEM_PROMPT = """
-You are a Documentation Agent. Your goal is to answer user questions using the project wiki.
-You have access to tools: `list_files` and `read_file`.
+You are a System Documentation Agent. Your goal is to answer user questions using:
+1. Project wiki/documentation files (in wiki/ directory)
+2. Source code files (in backend/, frontend/, etc.)
+3. The live backend API (for data queries and system behavior)
 
-Instructions:
-1. Use `list_files` to discover wiki files (look in 'wiki/' directory first).
-2. Use `read_file` to read specific content from files you find.
-3. Find the exact answer and the source section.
-4. When you have the answer, respond with a JSON object ONLY. Do not add markdown formatting.
-   Format: {"answer": "your answer", "source": "path/to/file.md#section-anchor"}
-5. The source must include the file path and a section anchor (e.g., wiki/git-workflow.md#resolving-merge-conflicts).
-6. If you cannot find the answer after searching, state that in the JSON answer.
+Available tools:
+- `list_files`: Discover files in a directory
+- `read_file`: Read content of wiki, docs, or source code files
+- `query_api`: Query the live backend API for data or system status
+
+Tool selection guide:
+- Use `read_file`/`list_files` for: wiki questions, documentation lookups, reading source code to understand framework/architecture/bugs
+- Use `query_api` for: counting items, checking status codes, querying analytics, testing API behavior, diagnosing runtime errors
+
+Response format:
+When you have the answer, respond with a JSON object ONLY. Do not add markdown formatting.
+Format: {"answer": "your answer", "source": "path/to/file.md#section-anchor"}
+
+Rules:
+1. The source field should include file path and section anchor for wiki/code answers (e.g., wiki/git-workflow.md#resolving-merge-conflicts)
+2. For system/API questions where there's no file source, use "source": "system" or "source": "api"
+3. If you cannot find the answer after reasonable searching, state that clearly in the JSON answer
+4. Always be precise - quote exact values from code or API responses when possible
 """
 
 
@@ -211,8 +304,9 @@ def call_llm(messages: list, tool_calls_response: bool = False) -> dict:
     try:
         choice = response_data["choices"][0]
         message = choice["message"]
-        content = message.get("content", "")
-        tool_calls = message.get("tool_calls", [])
+        # Handle None content safely (LLM may return null when making tool calls)
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls") or []
     except (KeyError, IndexError) as e:
         raise ValueError(f"Unexpected API response format: {e}")
     
