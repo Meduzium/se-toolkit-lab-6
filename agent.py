@@ -338,7 +338,7 @@ def main():
                     name = tool_call.function.name
                     args = json.loads(tool_call.function.arguments)
                     
-                    print(f"Agent calling tool: {name} with {args}", file=sys.stderr)
+                    # print(f"Agent calling tool: {name} with {args}", file=sys.stderr)
 
                     if name == "list_files": 
                         result = list_files(args.get("path", "."))
