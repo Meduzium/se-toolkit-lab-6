@@ -1,64 +1,62 @@
-# Task 3: System Agent with `query_api` Tool
+# Implementation Plan - Task 3: The System Agent
 
-## Implementation Plan
+This plan details the upgrade of the Documentation Agent to a **System Agent** capable of querying live backend data and diagnosing system-level issues using the `query_api` tool.
 
-### Overview
-Task 3 extends the documentation agent from Task 2 by adding a `query_api` tool that allows the agent to query the live backend API. This enables answering two new question types:
-1. **Static system facts**: Framework, ports, status codes
-2. **Data-dependent queries**: Item counts, scores, analytics
+## 1. Technical Strategy
 
-### 1. Tool Schema Definition
+### Environment & Authentication
+The agent will be updated to read from two distinct secret sources:
+* **LLM Config**: `LLM_API_KEY`, `LLM_API_BASE`, and `LLM_MODEL` from `.env.agent.secret`.
+* **System Config**: `LMS_API_KEY` and `AGENT_API_BASE_URL` (defaulting to `http://localhost:42002`) from `.env.docker.secret`.
+* **Implementation**: Use `os.environ.get()` to ensure the autochecker can inject its own values during evaluation.
 
-#### `query_api` Function Signature
-```python
-def query_api(method: str, path: str, body: Optional[str] = None) -> str
-{
-  "type": "function",
-  "function": {
-    "name": "query_api",
-    "description": "Query the deployed backend API. Use for data-dependent questions (item counts, scores, analytics) or to check system behavior (status codes, error responses). Do NOT use for wiki/documentation questions.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "method": {
-          "type": "string",
-          "enum": ["GET", "POST", "PUT", "DELETE"],
-          "description": "HTTP method to use"
-        },
-        "path": {
-          "type": "string",
-          "description": "API endpoint path, e.g., '/items/', '/analytics/completion-rate?lab=lab-99'"
-        },
-        "body": {
-          "type": "string",
-          "description": "Optional JSON request body as a string (for POST/PUT)"
-        }
-      },
-      "required": ["method", "path"]
-    }
-  }
-}
+### Tool Definition: `query_api`
+* **Functionality**: A wrapper around the `httpx` or `requests` library.
+* **Schema**:
+    * `method`: HTTP verb (GET, POST, etc.).
+    * `path`: Endpoint relative to `AGENT_API_BASE_URL`.
+    * `body`: Optional JSON string for POST/PUT requests.
+* **Security**: Authentication will be handled by passing `LMS_API_KEY` in the request headers (e.g., `Authorization: Bearer <KEY>` or `X-API-Key`).
 
-You are a System Documentation Agent. Your goal is to answer user questions using:
-1. Project wiki/documentation files (in wiki/ directory)
-2. Source code files (in backend/, frontend/, etc.)
-3. The live backend API (for data queries and system behavior)
+### System Prompt Evolution
+The prompt will be updated to establish a hierarchy of truth:
+1.  **Live State**: Use `query_api` for counts, status codes, and dynamic errors.
+2.  **Logic/Structure**: Use `read_file` on source code to understand how endpoints work.
+3.  **Policy/Manuals**: Use `read_file` on `wiki/` for human-written procedures.
 
-Available tools:
-- `list_files`: Discover files in a directory
-- `read_file`: Read content of wiki, docs, or source code files
-- `query_api`: Query the live backend API for data or system status
+---
 
-Tool selection guide:
-- Use `read_file`/`list_files` for: wiki questions, documentation lookups, reading source code to understand framework/architecture/bugs
-- Use `query_api` for: counting items, checking status codes, querying analytics, testing API behavior, diagnosing runtime errors
+## 2. Key Implementation Steps
 
-Response format:
-When you have the answer, respond with a JSON object ONLY. Do not add markdown formatting.
-Format: {"answer": "your answer", "source": "path/to/file.md#section-anchor"}
+### Phase 1: Tool Integration
+1.  Define the `query_api` Python function.
+2.  Update the `tools` list in `agent.py` to include the `query_api` schema.
+3.  Refactor the environment loading logic to support multiple sources.
 
-Rules:
-1. The source field should include file path and section anchor for wiki/code answers
-2. For system/API questions where there's no file source, use "source": "system" or "source": "api"
-3. If you cannot find the answer after reasonable searching, state that clearly
-4. Always be precise - quote exact values from code or API responses when possible
+### Phase 2: The Agentic Loop Refinement
+1.  Ensure the loop correctly handles `null` content from the LLM when tool calls are present.
+2.  Maintain the 10-iteration cap and 60-second timeout.
+3.  Make the `source` field in the final JSON output optional.
+
+### Phase 3: Benchmarking & Iteration
+1.  Run `uv run run_eval.py` to get a baseline score.
+2.  Analyze failures (e.g., the LLM trying to read a file instead of querying the API).
+3.  Tweak tool descriptions in the schema to provide clearer hints to the LLM.
+
+---
+
+## 3. Benchmark Diagnosis (Initial Run)
+
+* **Initial Score**: 0/10 (Pre-implementation).
+* **First Failures**:
+    * *Question 4 (Item Count)*: Expected to fail because the agent currently lacks the `query_api` tool.
+    * *Question 6 (Bug Diagnosis)*: Expected to fail because the agent cannot yet correlate live 500 errors with source code lines.
+* **Iteration Strategy**:
+    1.  Implement `query_api` first to solve data-dependent questions.
+    2.  Update the system prompt specifically for "chain-of-thought" reasoning: "If an API returns an error, read the corresponding module in `backend/routers/` to find the bug."
+
+---
+
+## 4. Technical Considerations
+* **Path Traversal**: Ensure `list_files` and `read_file` maintain their security boundaries.
+* **JSON Robustness**: The agent must ensure that the `query_api` result (which is already JSON) is properly stringified so it doesn't break the agent's own output format.
